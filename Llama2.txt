@@ -1,0 +1,205 @@
+import torch
+from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
+import transformers
+
+model_id = '/kaggle/input/llama-2/pytorch/7b-chat-hf/1'
+
+device = f'cuda:{cuda.current_device()}' if cuda.is_available() else 'cpu'
+
+bnb_config = BitsAndBytesConfig(
+    load_in_4bit=True,
+    bnb_4bit_use_double_quant=True,
+    bnb_4bit_quant_type="nf4",
+    bnb_4bit_compute_dtype=torch.bfloat16
+)
+
+model = AutoModelForCausalLM.from_pretrained(model_id, quantization_config=bnb_config, device_map="auto")
+
+tokenizer = AutoTokenizer.from_pretrained(model_id)
+tokenizer.pad_token = tokenizer.eos_token
+tokenizer.padding_side = "right"
+
+print(f"Model loaded on {device}")
+
+
+!pip install -q -U trl
+
+file_path_1 = "/kaggle/input/finance-bench-dataset/10_labels.csv"
+file_path_2 = "/kaggle/input/finance-bench-dataset/syntheses_10.csv"
+Model_Generated_Data = pd.read_csv(file_path_1)
+Finance_data = pd.read_csv(file_path_2)
+print(Finance_data.head())
+
+# Reduce Finance_data to the first 50 rows
+Finance_Reduced_Test = Finance_data.head(50)
+Finance_Reduced_Train = Finance_data.tail(100)
+# Print the reduced DataFrame to verify
+print(len(Finance_Reduced_Train))
+print(len(Finance_Reduced_Test))
+
+Finance_Reduced_Train.drop('syntheses', axis=1, inplace=True)
+Finance_Reduced_Train.columns
+Finance_Reduced_Train_Reduced_80 = Finance_Reduced_Train.head(80)
+Validation_20 = Finance_Reduced_Train.tail(20)
+len(Finance_Reduced_Train_Reduced_80)
+len(Validation_20)
+
+import pandas as pd
+from datasets import Dataset
+
+
+prompts = []
+for idx, row in Finance_Reduced_Train_Reduced_80.iterrows():
+    question = row['question']
+    answer = row['answer']
+    evidence_text = row['evidence_text']  # Assuming you have access to this column
+
+    SYSTEM_PROMPT = """You are a financial chatbot trained to answer questions based on the information provided.
+Your responses should be directly sourced from the content of these evidence_text(context).
+When asked a question, ensure that your answer is explicitly supported by the text and do not
+include any external information, interpretations, or assumptions not clearly stated in the evidence_text(context).
+If a question pertains to financial data or analysis that is not explicitly covered in the evidence_text(context) provided,
+respond by stating that the information is not available in the evidence_text(context).
+Your primary focus should be on accuracy, specificity, and adherence to the information in the evidence_text(context),
+particularly regarding financial statements, company performance, and market positions."""
+
+    prompt = f"<s>[INST]\n<<SYS>>\n{SYSTEM_PROMPT}\n<</SYS>>\n{question}\n{evidence_text}\n[/INST]\n{answer}\n</s>"
+    prompts.append(prompt)
+
+dataset = Dataset.from_pandas(pd.DataFrame({'text': prompts}))
+dataset
+
+
+prompts = []
+for idx, row in Validation_20.iterrows():
+    question = row['question']
+    answer = row['answer']
+    evidence_text = row['evidence_text']  # Assuming you have access to this column
+
+    SYSTEM_PROMPT = """You are a financial chatbot trained to answer questions based on the information provided.
+Your responses should be directly sourced from the content of these evidence_text(context).
+When asked a question, ensure that your answer is explicitly supported by the text and do not
+include any external information, interpretations, or assumptions not clearly stated in the evidence_text(context).
+If a question pertains to financial data or analysis that is not explicitly covered in the evidence_text(context) provided,
+respond by stating that the information is not available in the evidence_text(context).
+Your primary focus should be on accuracy, specificity, and adherence to the information in the evidence_text(context),
+particularly regarding financial statements, company performance, and market positions."""
+
+    prompt = f"<s>[INST]\n<<SYS>>\n{SYSTEM_PROMPT}\n<</SYS>>\n{question}\n{evidence_text}\n[/INST]\n{answer}\n</s>"
+    prompts.append(prompt)
+
+eval_dataset = Dataset.from_pandas(pd.DataFrame({'text': prompts}))
+eval_dataset
+
+
+def print_trainable_parameters(model):
+    """
+    Prints the number of trainable parameters in the model.
+    """
+    trainable_params = 0
+    all_param = 0
+    for _, param in model.named_parameters():
+
+        all_param += param.numel()
+        if param.requires_grad:
+            trainable_params += param.numel()
+    print(
+        f"trainable params: {trainable_params} || all params: {all_param} || trainable%: {100 * trainable_params / all_param}"
+    )
+
+from peft import prepare_model_for_kbit_training
+
+model.gradient_checkpointing_enable()
+model = prepare_model_for_kbit_training(model)
+
+print(model)
+
+from peft import LoraConfig, get_peft_model
+
+lora_config = LoraConfig(
+    r=16,
+    lora_alpha=64,
+    # target_modules=["query_key_value"],
+    target_modules=["q_proj", "k_proj", "v_proj", "o_proj"], #specific to Llama models.
+    lora_dropout=0.1,
+    bias="none",
+    task_type="CAUSAL_LM"
+)
+
+model = get_peft_model(model, lora_config)
+print_trainable_parameters(model)
+
+from huggingface_hub import notebook_login
+
+notebook_login()
+
+from transformers import TrainingArguments
+
+training_arguments = TrainingArguments(
+    "Fine_Tuned_LLama2_5_Epoch",
+    per_device_train_batch_size=4,
+    gradient_accumulation_steps=4,
+    optim="paged_adamw_32bit",
+    logging_steps=1,
+    learning_rate=2e-5,
+    fp16=True,
+    weight_decay=0.01,
+    max_grad_norm=0.3,
+    num_train_epochs=5,
+    evaluation_strategy="steps",
+    eval_steps=0.2,
+    warmup_ratio=0.05,
+    save_strategy="epoch",
+    group_by_length=True,
+    lr_scheduler_type="cosine",
+    seed=42,
+    push_to_hub=True,
+)
+model.config.use_cache = False  # silence the warnings. Please re-enable for inference!
+
+trainer = SFTTrainer(
+    model=model,
+    train_dataset=dataset,
+    eval_dataset=eval_dataset,
+    peft_config=lora_config,
+    dataset_text_field="text",
+    max_seq_length=100,
+    tokenizer=tokenizer,
+    args=training_arguments,
+)
+
+Fine_tuned_LLama2_5_Epoch = trainer.train()
+
+
+import torch
+from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
+import transformers
+
+model_id_1 = '/kaggle/working/Fine_Tuned_LLama2_5_Epoch'
+model_id_2 = '/kaggle/working/Fine_Tuned_LLama2_10_Epoch'
+model_id_3 = '/kaggle/working/Fine_Tuned_LLama2_15_Epoch'
+
+#device = f'cuda:{cuda.current_device()}' if cuda.is_available() else 'cpu'
+
+bnb_config = BitsAndBytesConfig(
+    load_in_4bit=True,
+    bnb_4bit_use_double_quant=True,
+    bnb_4bit_quant_type="nf4",
+    bnb_4bit_compute_dtype=torch.bfloat16
+)
+
+# fine_tuned_80_5_Epoch = AutoModelForCausalLM.from_pretrained(model_id_1, quantization_config=bnb_config, device_map="auto")
+# tokenizer_1 = AutoTokenizer.from_pretrained(model_id_1)
+# tokenizer_1.pad_token = tokenizer_1.eos_token
+# tokenizer_1.padding_side = "right"
+
+# fine_tuned_80_10_Epoch = AutoModelForCausalLM.from_pretrained(model_id_2, quantization_config=bnb_config, device_map="auto")
+# tokenizer_2 = AutoTokenizer.from_pretrained(model_id_2)
+# tokenizer_2.pad_token = tokenizer_2.eos_token
+# tokenizer_2.padding_side = "right"
+
+fine_tuned_80_15_Epoch = AutoModelForCausalLM.from_pretrained(model_id_3, quantization_config=bnb_config, device_map="auto")
+tokenizer_3 = AutoTokenizer.from_pretrained(model_id_3)
+tokenizer_3.pad_token = tokenizer_3.eos_token
+tokenizer_3.padding_side = "right"
+
